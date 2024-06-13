@@ -18,8 +18,8 @@ use surrealdb::iam::check::check_ns_db;
 use surrealdb::iam::Action::{Edit, View};
 use surrealdb::iam::ResourceKind::Model;
 use surrealdb::kvs::{LockType::Optimistic, TransactionType::Read};
+use surrealdb::ml::storage::surml_file::SurMlFile;
 use surrealdb::sql::statements::{DefineModelStatement, DefineStatement};
-use surrealml_core::storage::surml_file::SurMlFile;
 use tower_http::limit::RequestBodyLimitLayer;
 
 const MAX: usize = 1024 * 1024 * 1024 * 4; // 4 GiB
@@ -61,6 +61,12 @@ async fn import(
 		Ok(file) => file,
 		Err(err) => return Err(Error::Other(err.to_string())),
 	};
+
+	// reject the file if there is no model name or version
+	if file.header.name.to_string() == "" || file.header.version.to_string() == "" {
+		return Err(Error::Other("Model name and version must be set".to_string()));
+	}
+
 	// Convert the file back in to raw bytes
 	let data = file.to_bytes();
 	// Calculate the hash of the model file
@@ -74,19 +80,12 @@ async fn import(
 	// Insert the file data in to the store
 	surrealdb::obs::put(&path, data).await?;
 	// Insert the model in to the database
-	db.process(
-		DefineStatement::Model(DefineModelStatement {
-			hash,
-			name: file.header.name.to_string().into(),
-			version: file.header.version.to_string(),
-			comment: Some(file.header.description.to_string().into()),
-			..Default::default()
-		})
-		.into(),
-		&session,
-		None,
-	)
-	.await?;
+	let mut model = DefineModelStatement::default();
+	model.name = file.header.name.to_string().into();
+	model.version = file.header.version.to_string();
+	model.comment = Some(file.header.description.to_string().into());
+	model.hash = hash;
+	db.process(DefineStatement::Model(model).into(), &session, None).await?;
 	//
 	Ok(output::none())
 }

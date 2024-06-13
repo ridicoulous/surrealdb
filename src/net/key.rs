@@ -97,6 +97,7 @@ async fn select_all(
 			Some(Accept::ApplicationCbor) => Ok(output::cbor(&output::simplify(res))),
 			Some(Accept::ApplicationPack) => Ok(output::pack(&output::simplify(res))),
 			// Internal serialization
+			// TODO: remove format in 2.0.0
 			Some(Accept::Surrealdb) => Ok(output::full(&res)),
 			// An incorrect content-type was requested
 			_ => Err(Error::InvalidType),
@@ -167,7 +168,7 @@ async fn update_all(
 	match surrealdb::sql::value(data) {
 		Ok(data) => {
 			// Specify the request statement
-			let sql = "UPDATE type::table($table) CONTENT $data";
+			let sql = "UPSERT type::table($table) CONTENT $data";
 			// Specify the request variables
 			let vars = map! {
 				String::from("table") => Value::from(table),
@@ -211,7 +212,7 @@ async fn modify_all(
 	match surrealdb::sql::value(data) {
 		Ok(data) => {
 			// Specify the request statement
-			let sql = "UPDATE type::table($table) MERGE $data";
+			let sql = "UPSERT type::table($table) MERGE $data";
 			// Specify the request variables
 			let vars = map! {
 				String::from("table") => Value::from(table),
@@ -391,7 +392,7 @@ async fn update_one(
 	match surrealdb::sql::value(data) {
 		Ok(data) => {
 			// Specify the request statement
-			let sql = "UPDATE type::thing($table, $id) CONTENT $data";
+			let sql = "UPSERT type::thing($table, $id) CONTENT $data";
 			// Specify the request variables
 			let vars = map! {
 				String::from("table") => Value::from(table),
@@ -441,7 +442,7 @@ async fn modify_one(
 	match surrealdb::sql::value(data) {
 		Ok(data) => {
 			// Specify the request statement
-			let sql = "UPDATE type::thing($table, $id) MERGE $data";
+			let sql = "UPSERT type::thing($table, $id) MERGE $data";
 			// Specify the request variables
 			let vars = map! {
 				String::from("table") => Value::from(table),

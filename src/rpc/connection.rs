@@ -1,12 +1,10 @@
-use crate::cnf::PKG_NAME;
-use crate::cnf::PKG_VERSION;
-use crate::cnf::{WEBSOCKET_MAX_CONCURRENT_REQUESTS, WEBSOCKET_PING_FREQUENCY};
+use crate::cnf::{
+	PKG_NAME, PKG_VERSION, WEBSOCKET_MAX_CONCURRENT_REQUESTS, WEBSOCKET_PING_FREQUENCY,
+};
 use crate::dbs::DB;
-use crate::err::Error;
-use crate::rpc::args::Take;
 use crate::rpc::failure::Failure;
-use crate::rpc::format::Format;
-use crate::rpc::response::{failure, Data, IntoRpcResponse};
+use crate::rpc::format::WsFormat;
+use crate::rpc::response::{failure, IntoRpcResponse};
 use crate::rpc::{CONN_CLOSED_ERR, LIVE_QUERIES, WEBSOCKETS};
 use crate::telemetry;
 use crate::telemetry::metrics::ws::RequestContext;
@@ -19,12 +17,14 @@ use opentelemetry::Context as TelemetryContext;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use surrealdb::channel::{self, Receiver, Sender};
-use surrealdb::dbs::QueryType;
-use surrealdb::dbs::Response;
 use surrealdb::dbs::Session;
+use surrealdb::kvs::Datastore;
+use surrealdb::rpc::args::Take;
+use surrealdb::rpc::format::Format;
+use surrealdb::rpc::method::Method;
+use surrealdb::rpc::RpcContext;
+use surrealdb::rpc::{Data, RpcError};
 use surrealdb::sql::Array;
-use surrealdb::sql::Object;
-use surrealdb::sql::Strand;
 use surrealdb::sql::Value;
 use tokio::sync::{RwLock, Semaphore};
 use tokio::task::JoinSet;
@@ -293,9 +293,9 @@ impl Connection {
 		async move {
 			let span = Span::current();
 			let req_cx = RequestContext::default();
-			let otel_cx = TelemetryContext::new().with_value(req_cx.clone());
+			let otel_cx = Arc::new(TelemetryContext::new().with_value(req_cx.clone()));
 			// Parse the RPC request structure
-			match fmt.req(msg) {
+			match fmt.req_ws(msg) {
 				Ok(req) => {
 					// Now that we know the method, we can update the span and create otel context
 					span.record("rpc.method", &req.method);
@@ -304,18 +304,24 @@ impl Connection {
 						"rpc.request_id",
 						req.id.clone().map(Value::as_string).unwrap_or_default(),
 					);
-					let otel_cx = TelemetryContext::current_with_value(
+					let otel_cx = Arc::new(TelemetryContext::current_with_value(
 						req_cx.with_method(&req.method).with_size(len),
-					);
+					));
 					// Process the message
 					let res =
 						Connection::process_message(rpc.clone(), &req.method, req.params).await;
 					// Process the response
-					res.into_response(req.id).send(fmt, &chn).with_context(otel_cx).await
+					res.into_response(req.id)
+						.send(otel_cx.clone(), fmt, &chn)
+						.with_context(otel_cx.as_ref().clone())
+						.await
 				}
 				Err(err) => {
 					// Process the response
-					failure(None, err).send(fmt, &chn).with_context(otel_cx).await
+					failure(None, err)
+						.send(otel_cx.clone(), fmt, &chn)
+						.with_context(otel_cx.as_ref().clone())
+						.await
 				}
 			}
 		}
@@ -331,146 +337,12 @@ impl Connection {
 		params: Array,
 	) -> Result<Data, Failure> {
 		debug!("Process RPC request");
-		// Match the method to a function
-		match method {
-			// Handle a surrealdb ping message
-			//
-			// This is used to keep the WebSocket connection alive in environments where the WebSocket protocol is not enough.
-			// For example, some browsers will wait for the TCP protocol to timeout before triggering an on_close event. This may take several seconds or even minutes in certain scenarios.
-			// By sending a ping message every few seconds from the client, we can force a connection check and trigger an on_close event if the ping can't be sent.
-			//
-			"ping" => Ok(Value::None.into()),
-			// Retrieve the current auth record
-			"info" => match params.len() {
-				0 => rpc.read().await.info().await.map(Into::into).map_err(Into::into),
-				_ => Err(Failure::INVALID_PARAMS),
-			},
-			// Switch to a specific namespace and database
-			"use" => match params.needs_two() {
-				Ok((ns, db)) => {
-					rpc.write().await.yuse(ns, db).await.map(Into::into).map_err(Into::into)
-				}
-				_ => Err(Failure::INVALID_PARAMS),
-			},
-			// Signup to a specific authentication scope
-			"signup" => match params.needs_one() {
-				Ok(Value::Object(v)) => {
-					rpc.write().await.signup(v).await.map(Into::into).map_err(Into::into)
-				}
-				_ => Err(Failure::INVALID_PARAMS),
-			},
-			// Signin as a root, namespace, database or scope user
-			"signin" => match params.needs_one() {
-				Ok(Value::Object(v)) => {
-					rpc.write().await.signin(v).await.map(Into::into).map_err(Into::into)
-				}
-				_ => Err(Failure::INVALID_PARAMS),
-			},
-			// Invalidate the current authentication session
-			"invalidate" => match params.len() {
-				0 => rpc.write().await.invalidate().await.map(Into::into).map_err(Into::into),
-				_ => Err(Failure::INVALID_PARAMS),
-			},
-			// Authenticate using an authentication token
-			"authenticate" => match params.needs_one() {
-				Ok(Value::Strand(v)) => {
-					rpc.write().await.authenticate(v).await.map(Into::into).map_err(Into::into)
-				}
-				_ => Err(Failure::INVALID_PARAMS),
-			},
-			// Kill a live query using a query id
-			"kill" => match params.needs_one() {
-				Ok(v) => rpc.read().await.kill(v).await.map(Into::into).map_err(Into::into),
-				_ => Err(Failure::INVALID_PARAMS),
-			},
-			// Setup a live query on a specific table
-			"live" => match params.needs_one_or_two() {
-				Ok((v, d)) if v.is_table() => {
-					rpc.read().await.live(v, d).await.map(Into::into).map_err(Into::into)
-				}
-				Ok((v, d)) if v.is_strand() => {
-					rpc.read().await.live(v, d).await.map(Into::into).map_err(Into::into)
-				}
-				_ => Err(Failure::INVALID_PARAMS),
-			},
-			// Specify a connection-wide parameter
-			"let" | "set" => match params.needs_one_or_two() {
-				Ok((Value::Strand(s), v)) => {
-					rpc.write().await.set(s, v).await.map(Into::into).map_err(Into::into)
-				}
-				_ => Err(Failure::INVALID_PARAMS),
-			},
-			// Unset and clear a connection-wide parameter
-			"unset" => match params.needs_one() {
-				Ok(Value::Strand(s)) => {
-					rpc.write().await.unset(s).await.map(Into::into).map_err(Into::into)
-				}
-				_ => Err(Failure::INVALID_PARAMS),
-			},
-			// Select a value or values from the database
-			"select" => match params.needs_one() {
-				Ok(v) => rpc.read().await.select(v).await.map(Into::into).map_err(Into::into),
-				_ => Err(Failure::INVALID_PARAMS),
-			},
-			// Insert a value or values in the database
-			"insert" => match params.needs_one_or_two() {
-				Ok((v, o)) => {
-					rpc.read().await.insert(v, o).await.map(Into::into).map_err(Into::into)
-				}
-				_ => Err(Failure::INVALID_PARAMS),
-			},
-			// Create a value or values in the database
-			"create" => match params.needs_one_or_two() {
-				Ok((v, o)) => {
-					rpc.read().await.create(v, o).await.map(Into::into).map_err(Into::into)
-				}
-				_ => Err(Failure::INVALID_PARAMS),
-			},
-			// Update a value or values in the database using `CONTENT`
-			"update" => match params.needs_one_or_two() {
-				Ok((v, o)) => {
-					rpc.read().await.update(v, o).await.map(Into::into).map_err(Into::into)
-				}
-				_ => Err(Failure::INVALID_PARAMS),
-			},
-			// Update a value or values in the database using `MERGE`
-			"merge" => match params.needs_one_or_two() {
-				Ok((v, o)) => {
-					rpc.read().await.merge(v, o).await.map(Into::into).map_err(Into::into)
-				}
-				_ => Err(Failure::INVALID_PARAMS),
-			},
-			// Update a value or values in the database using `PATCH`
-			"patch" => match params.needs_one_two_or_three() {
-				Ok((v, o, d)) => {
-					rpc.read().await.patch(v, o, d).await.map(Into::into).map_err(Into::into)
-				}
-				_ => Err(Failure::INVALID_PARAMS),
-			},
-			// Delete a value or values from the database
-			"delete" => match params.needs_one() {
-				Ok(v) => rpc.read().await.delete(v).await.map(Into::into).map_err(Into::into),
-				_ => Err(Failure::INVALID_PARAMS),
-			},
-			// Get the current server version
-			"version" => match params.len() {
-				0 => Ok(format!("{PKG_NAME}-{}", *PKG_VERSION).into()),
-				_ => Err(Failure::INVALID_PARAMS),
-			},
-			// Run a full SurrealQL query against the database
-			"query" => match params.needs_one_or_two() {
-				Ok((v, o)) if (v.is_strand() || v.is_query()) && o.is_none_or_null() => {
-					rpc.read().await.query(v).await.map(Into::into).map_err(Into::into)
-				}
-				Ok((v, Value::Object(o))) if v.is_strand() || v.is_query() => {
-					rpc.read().await.query_with(v, o).await.map(Into::into).map_err(Into::into)
-				}
-				_ => Err(Failure::INVALID_PARAMS),
-			},
-			_ => Err(Failure::METHOD_NOT_FOUND),
+		let method = Method::parse(method);
+		if !method.is_valid() {
+			return Err(Failure::METHOD_NOT_FOUND);
 		}
-	}
 
+<<<<<<< HEAD
 	// ------------------------------
 	// Methods for authentication
 	// ------------------------------
@@ -872,6 +744,87 @@ impl Connection {
 				}
 			}
 			_ => {}
+=======
+		// if the write lock is a bottleneck then execute could be refactored into execute_mut and execute
+		// rpc.write().await.execute(method, params).await.map_err(Into::into)
+		match method.needs_mut() {
+			true => rpc.write().await.execute(method, params).await.map_err(Into::into),
+			false => rpc.read().await.execute_immut(method, params).await.map_err(Into::into),
+>>>>>>> main
 		}
+	}
+}
+
+impl RpcContext for Connection {
+	fn kvs(&self) -> &Datastore {
+		DB.get().unwrap()
+	}
+
+	fn session(&self) -> &Session {
+		&self.session
+	}
+
+	fn session_mut(&mut self) -> &mut Session {
+		&mut self.session
+	}
+
+	fn vars(&self) -> &BTreeMap<String, Value> {
+		&self.vars
+	}
+
+	fn vars_mut(&mut self) -> &mut BTreeMap<String, Value> {
+		&mut self.vars
+	}
+
+	fn version_data(&self) -> impl Into<Data> {
+		format!("{PKG_NAME}-{}", *PKG_VERSION)
+	}
+
+	const LQ_SUPPORT: bool = true;
+
+	async fn handle_live(&self, lqid: &Uuid) {
+		LIVE_QUERIES.write().await.insert(*lqid, self.id);
+		trace!("Registered live query {} on websocket {}", lqid, self.id);
+	}
+
+	async fn handle_kill(&self, lqid: &Uuid) {
+		if let Some(id) = LIVE_QUERIES.write().await.remove(lqid) {
+			trace!("Unregistered live query {} on websocket {}", lqid, id);
+		}
+	}
+
+	// reimplimentaions
+
+	async fn signup(&mut self, params: Array) -> Result<impl Into<Data>, RpcError> {
+		let Ok(Value::Object(v)) = params.needs_one() else {
+			return Err(RpcError::InvalidParams);
+		};
+		let out: Result<Value, RpcError> =
+			surrealdb::iam::signup::signup(DB.get().unwrap(), &mut self.session, v)
+				.await
+				.map(Into::into)
+				.map_err(Into::into);
+
+		out
+	}
+
+	async fn signin(&mut self, params: Array) -> Result<impl Into<Data>, RpcError> {
+		let Ok(Value::Object(v)) = params.needs_one() else {
+			return Err(RpcError::InvalidParams);
+		};
+		let out: Result<Value, RpcError> =
+			surrealdb::iam::signin::signin(DB.get().unwrap(), &mut self.session, v)
+				.await
+				.map(Into::into)
+				.map_err(Into::into);
+		out
+	}
+
+	async fn authenticate(&mut self, params: Array) -> Result<impl Into<Data>, RpcError> {
+		let Ok(Value::Strand(token)) = params.needs_one() else {
+			return Err(RpcError::InvalidParams);
+		};
+		surrealdb::iam::verify::token(DB.get().unwrap(), &mut self.session, &token.0).await?;
+		Ok(Value::None)
 	}
 }

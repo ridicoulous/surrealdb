@@ -9,6 +9,7 @@ use crate::api::opt::Endpoint;
 use crate::api::OnceLockExt;
 use crate::api::Result;
 use crate::api::Surreal;
+use crate::opt::WaitFor;
 use flume::Receiver;
 use flume::Sender;
 use futures::StreamExt;
@@ -22,6 +23,7 @@ use std::pin::Pin;
 use std::sync::atomic::AtomicI64;
 use std::sync::Arc;
 use std::sync::OnceLock;
+use tokio::sync::watch;
 use url::Url;
 use wasm_bindgen_futures::spawn_local;
 
@@ -50,14 +52,14 @@ impl Connection for Client {
 
 			conn_rx.into_recv_async().await??;
 
-			Ok(Surreal {
-				router: Arc::new(OnceLock::with_value(Router {
+			Ok(Surreal::new_from_router_waiter(
+				Arc::new(OnceLock::with_value(Router {
 					features: HashSet::new(),
 					sender: route_tx,
 					last_id: AtomicI64::new(0),
 				})),
-				engine: PhantomData,
-			})
+				Arc::new(watch::channel(Some(WaitFor::Connection))),
+			))
 		})
 	}
 

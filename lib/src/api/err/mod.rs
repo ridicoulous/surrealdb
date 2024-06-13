@@ -1,6 +1,7 @@
 use crate::api::Response;
 use crate::sql::Array;
 use crate::sql::Edges;
+use crate::sql::FromValueError;
 use crate::sql::Object;
 use crate::sql::Thing;
 use crate::sql::Value;
@@ -193,6 +194,18 @@ pub enum Error {
 	/// Called `Response::take` or `Response::stream` on a query response more than once
 	#[error("Tried to take a query response that has already been taken")]
 	ResponseAlreadyTaken,
+
+	/// Tried to insert on an object
+	#[error("Insert queries on objects not supported: {0}")]
+	InsertOnObject(Object),
+
+	/// Tried to insert on an array
+	#[error("Insert queries on arrays not supported: {0}")]
+	InsertOnArray(Array),
+
+	/// Tried to insert on an edge or edges
+	#[error("Insert queries on edges not supported: {0}")]
+	InsertOnEdges(Edges),
 }
 
 #[cfg(feature = "protocol-http")]
@@ -250,5 +263,14 @@ impl Serialize for Error {
 		S: serde::Serializer,
 	{
 		serializer.serialize_str(self.to_string().as_str())
+	}
+}
+
+impl From<FromValueError> for crate::Error {
+	fn from(error: FromValueError) -> Self {
+		Self::Api(Error::FromValue {
+			value: error.value,
+			error: error.error,
+		})
 	}
 }

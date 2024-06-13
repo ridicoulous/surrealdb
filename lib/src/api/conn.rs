@@ -6,7 +6,7 @@ use crate::api::ExtraFeatures;
 use crate::api::Result;
 use crate::api::Surreal;
 use crate::dbs::Notification;
-use crate::opt::from_value;
+use crate::sql::from_value;
 use crate::sql::Query;
 use crate::sql::Value;
 use flume::Receiver;
@@ -68,6 +68,8 @@ pub enum Method {
 	Import,
 	/// Invalidates a session
 	Invalidate,
+	/// Inserts a record or records into a table
+	Insert,
 	/// Kills a live query
 	#[doc(hidden)] // Not supported yet
 	Kill,
@@ -90,6 +92,8 @@ pub enum Method {
 	Unset,
 	/// Performs an update operation
 	Update,
+	/// Performs an upsert operation
+	Upsert,
 	/// Selects a namespace and database to use
 	Use,
 	/// Queries the version of the server

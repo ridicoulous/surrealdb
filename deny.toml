@@ -98,27 +98,26 @@ confidence-threshold = 0.95
 
 [[licenses.exceptions]]
 name = "ring"
-version = "*"
 allow = ["OpenSSL"]
 
 [[licenses.exceptions]]
 name = "surreal"
-version = "*"
 allow = ["BUSL-1.1"]
 
 [[licenses.exceptions]]
 name = "surrealdb"
-version = "*"
+allow = ["BUSL-1.1"]
+
+[[licenses.exceptions]]
+name = "surrealdb-core"
 allow = ["BUSL-1.1"]
 
 [[licenses.exceptions]]
 name = "surrealml-core"
-version = "*"
 allow = ["Apache-2.0"]
 
 [[licenses.exceptions]]
 name = "unicode-ident"
-version = "*"
 allow = ["Unicode-DFS-2016"]
 
 # Specify overrides for crates where licenses are hard to guess.
@@ -130,6 +129,11 @@ license-files = []
 
 [[licenses.clarify]]
 name = "surrealdb"
+expression = "BUSL-1.1"
+license-files = []
+
+[[licenses.clarify]]
+name = "surrealdb-core"
 expression = "BUSL-1.1"
 license-files = []
 

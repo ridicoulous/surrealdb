@@ -1,7 +1,8 @@
-use crate::api::{err::Error, opt::from_value, Response as QueryResponse, Result};
+use crate::api::{err::Error, Response as QueryResponse, Result};
 use crate::method;
 use crate::method::{Stats, Stream};
-use crate::sql::{self, statements::*, Array, Object, Statement, Statements, Value};
+use crate::sql::from_value;
+use crate::sql::{self, statements::*, Statement, Statements, Value};
 use crate::{syn, Notification};
 use futures::future::Either;
 use futures::stream::select_all;
@@ -17,15 +18,13 @@ pub trait IntoQuery {
 
 impl IntoQuery for sql::Query {
 	fn into_query(self) -> Result<Vec<Statement>> {
-		let sql::Query(Statements(statements)) = self;
-		Ok(statements)
+		Ok(self.0 .0)
 	}
 }
 
 impl IntoQuery for Statements {
 	fn into_query(self) -> Result<Vec<Statement>> {
-		let Statements(statements) = self;
-		Ok(statements)
+		Ok(self.0)
 	}
 }
 
@@ -189,7 +188,7 @@ where
 
 impl QueryResult<Value> for usize {
 	fn query_result(self, response: &mut QueryResponse) -> Result<Value> {
-		match response.results.remove(&self) {
+		match response.results.swap_remove(&self) {
 			Some((_, result)) => Ok(result?),
 			None => Ok(Value::None),
 		}
@@ -210,7 +209,7 @@ where
 				Ok(val) => val,
 				Err(error) => {
 					let error = mem::replace(error, Error::ConnectionUninitialised.into());
-					response.results.remove(&self);
+					response.results.swap_remove(&self);
 					return Err(error);
 				}
 			},
@@ -219,7 +218,7 @@ where
 			}
 		};
 		let result = match value {
-			Value::Array(Array(vec)) => match &mut vec[..] {
+			Value::Array(vec) => match &mut vec.0[..] {
 				[] => Ok(None),
 				[value] => {
 					let value = mem::take(value);
@@ -237,7 +236,7 @@ where
 				from_value(value).map_err(Into::into)
 			}
 		};
-		response.results.remove(&self);
+		response.results.swap_remove(&self);
 		result
 	}
 
@@ -254,7 +253,7 @@ impl QueryResult<Value> for (usize, &str) {
 				Ok(val) => val,
 				Err(error) => {
 					let error = mem::replace(error, Error::ConnectionUninitialised.into());
-					response.results.remove(&index);
+					response.results.swap_remove(&index);
 					return Err(error);
 				}
 			},
@@ -264,7 +263,7 @@ impl QueryResult<Value> for (usize, &str) {
 		};
 
 		let value = match value {
-			Value::Object(Object(object)) => object.remove(key).unwrap_or_default(),
+			Value::Object(object) => object.remove(key).unwrap_or_default(),
 			_ => Value::None,
 		};
 
@@ -287,7 +286,7 @@ where
 				Ok(val) => val,
 				Err(error) => {
 					let error = mem::replace(error, Error::ConnectionUninitialised.into());
-					response.results.remove(&index);
+					response.results.swap_remove(&index);
 					return Err(error);
 				}
 			},
@@ -296,9 +295,9 @@ where
 			}
 		};
 		let value = match value {
-			Value::Array(Array(vec)) => match &mut vec[..] {
+			Value::Array(vec) => match &mut vec.0[..] {
 				[] => {
-					response.results.remove(&index);
+					response.results.swap_remove(&index);
 					return Ok(None);
 				}
 				[value] => value,
@@ -315,12 +314,12 @@ where
 		};
 		match value {
 			Value::None | Value::Null => {
-				response.results.remove(&index);
+				response.results.swap_remove(&index);
 				Ok(None)
 			}
-			Value::Object(Object(object)) => {
+			Value::Object(object) => {
 				if object.is_empty() {
-					response.results.remove(&index);
+					response.results.swap_remove(&index);
 					return Ok(None);
 				}
 				let Some(value) = object.remove(key) else {
@@ -342,9 +341,9 @@ where
 	T: DeserializeOwned,
 {
 	fn query_result(self, response: &mut QueryResponse) -> Result<Vec<T>> {
-		let vec = match response.results.remove(&self) {
+		let vec = match response.results.swap_remove(&self) {
 			Some((_, result)) => match result? {
-				Value::Array(Array(vec)) => vec,
+				Value::Array(vec) => vec.0,
 				vec => vec![vec],
 			},
 			None => {
@@ -368,7 +367,7 @@ where
 		let mut response = match response.results.get_mut(&index) {
 			Some((_, result)) => match result {
 				Ok(val) => match val {
-					Value::Array(Array(vec)) => mem::take(vec),
+					Value::Array(vec) => mem::take(&mut vec.0),
 					val => {
 						let val = mem::take(val);
 						vec![val]
@@ -376,7 +375,7 @@ where
 				},
 				Err(error) => {
 					let error = mem::replace(error, Error::ConnectionUninitialised.into());
-					response.results.remove(&index);
+					response.results.swap_remove(&index);
 					return Err(error);
 				}
 			},
@@ -386,7 +385,7 @@ where
 		};
 		let mut vec = Vec::with_capacity(response.len());
 		for value in response.iter_mut() {
-			if let Value::Object(Object(object)) = value {
+			if let Value::Object(object) = value {
 				if let Some(value) = object.remove(key) {
 					vec.push(value);
 				}
@@ -434,10 +433,10 @@ impl QueryStream<Value> for usize {
 	fn query_stream(self, response: &mut QueryResponse) -> Result<method::QueryStream<Value>> {
 		let stream = response
 			.live_queries
-			.remove(&self)
+			.swap_remove(&self)
 			.and_then(|result| match result {
 				Err(crate::Error::Api(Error::NotLiveQuery(..))) => {
-					response.results.remove(&self).and_then(|x| x.1.err().map(Err))
+					response.results.swap_remove(&self).and_then(|x| x.1.err().map(Err))
 				}
 				result => Some(result),
 			})
@@ -455,7 +454,7 @@ impl QueryStream<Value> for () {
 		for (index, result) in mem::take(&mut response.live_queries) {
 			match result {
 				Ok(stream) => streams.push(stream),
-				Err(crate::Error::Api(Error::NotLiveQuery(..))) => match response.results.remove(&index) {
+				Err(crate::Error::Api(Error::NotLiveQuery(..))) => match response.results.swap_remove(&index) {
 					Some((stats, Err(error))) => {
 						response.results.insert(index, (stats, Err(Error::ResponseAlreadyTaken.into())));
 						return Err(error);
@@ -480,10 +479,10 @@ where
 	) -> Result<method::QueryStream<Notification<R>>> {
 		let mut stream = response
 			.live_queries
-			.remove(&self)
+			.swap_remove(&self)
 			.and_then(|result| match result {
 				Err(crate::Error::Api(Error::NotLiveQuery(..))) => {
-					response.results.remove(&self).and_then(|x| x.1.err().map(Err))
+					response.results.swap_remove(&self).and_then(|x| x.1.err().map(Err))
 				}
 				result => Some(result),
 			})
@@ -513,7 +512,7 @@ where
 		for (index, result) in mem::take(&mut response.live_queries) {
 			let mut stream = match result {
 				Ok(stream) => stream,
-				Err(crate::Error::Api(Error::NotLiveQuery(..))) => match response.results.remove(&index) {
+				Err(crate::Error::Api(Error::NotLiveQuery(..))) => match response.results.swap_remove(&index) {
 					Some((stats, Err(error))) => {
 						response.results.insert(index, (stats, Err(Error::ResponseAlreadyTaken.into())));
 						return Err(error);

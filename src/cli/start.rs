@@ -4,17 +4,17 @@ use crate::cli::validator::parser::env_filter::CustomEnvFilter;
 use crate::cli::validator::parser::env_filter::CustomEnvFilterParser;
 use crate::cnf::LOGO;
 use crate::dbs;
-use crate::dbs::StartCommandDbsOptions;
+use crate::dbs::{StartCommandDbsOptions, DB};
 use crate::env;
 use crate::err::Error;
 use crate::net::{self, client_ip::ClientIp};
-use crate::node;
 use clap::Args;
 use opentelemetry::Context as TelemetryContext;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 use surrealdb::engine::any::IntoEndpoint;
+use surrealdb::engine::tasks::start_tasks;
 use tokio_util::sync::CancellationToken;
 
 #[derive(Args, Debug)]
@@ -92,11 +92,14 @@ pub struct StartCommandArguments {
 	#[arg(env = "SURREAL_CLIENT_IP", long)]
 	#[arg(default_value = "socket", value_enum)]
 	client_ip: ClientIp,
-	#[arg(help = "The hostname or ip address to listen for connections on")]
+	#[arg(help = "The hostname or IP address to listen for connections on")]
 	#[arg(env = "SURREAL_BIND", short = 'b', long = "bind")]
-	#[arg(default_value = "0.0.0.0:8000")]
+	#[arg(default_value = "127.0.0.1:8000")]
 	listen_addresses: Vec<SocketAddr>,
-
+	#[arg(help = "Whether to suppress the server name and version headers")]
+	#[arg(env = "SURREAL_NO_IDENTIFICATION_HEADERS", long)]
+	#[arg(default_value_t = false)]
+	no_identification_headers: bool,
 	//
 	// Database options
 	//
@@ -142,6 +145,7 @@ pub async fn init(
 		log,
 		tick_interval,
 		no_banner,
+		no_identification_headers,
 		..
 	}: StartCommandArguments,
 ) -> Result<(), Error> {
@@ -171,8 +175,10 @@ pub async fn init(
 		user,
 		pass,
 		tick_interval,
+		no_identification_headers,
 		crt: web.as_ref().and_then(|x| x.web_crt.clone()),
 		key: web.as_ref().and_then(|x| x.web_key.clone()),
+		engine: None,
 	});
 	// This is the cancellation token propagated down to
 	// all the async functions that needs to be stopped gracefully.
@@ -182,14 +188,20 @@ pub async fn init(
 	// Start the kvs server
 	dbs::init(dbs).await?;
 	// Start the node agent
-	let nd = node::init(ct.clone());
+	let (tasks, task_chans) = start_tasks(
+		&config::CF.get().unwrap().engine.unwrap_or_default(),
+		DB.get().unwrap().clone(),
+	);
 	// Start the web server
-	net::init(ct).await?;
-	// Wait for the node agent to stop
-	if let Err(e) = nd.await {
-		error!("Node agent failed while running: {}", e);
-		return Err(Error::NodeAgent);
-	}
+	net::init(ct.clone()).await?;
+	// Shutdown and stop closed tasks
+	task_chans.into_iter().for_each(|chan| {
+		if let Err(e) = chan.send(()) {
+			error!("Failed to send shutdown signal to task: {}", e);
+		}
+	});
+	ct.cancel();
+	tasks.resolve().await?;
 	// All ok
 	Ok(())
 }

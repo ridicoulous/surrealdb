@@ -20,6 +20,7 @@ use std::pin::Pin;
 use std::sync::atomic::AtomicI64;
 use std::sync::Arc;
 use std::sync::OnceLock;
+use tokio::sync::watch;
 use url::Url;
 
 #[derive(Debug)]
@@ -29,11 +30,7 @@ impl IntoEndpoint<Test> for () {
 	type Client = Client;
 
 	fn into_endpoint(self) -> Result<Endpoint> {
-		Ok(Endpoint {
-			url: Url::parse("test://")?,
-			path: String::new(),
-			config: Default::default(),
-		})
+		Ok(Endpoint::new(Url::parse("test://")?))
 	}
 }
 
@@ -52,7 +49,7 @@ impl Surreal<Client> {
 			engine: PhantomData,
 			address: address.into_endpoint(),
 			capacity: 0,
-			client: PhantomData,
+			waiter: self.waiter.clone(),
 			response_type: PhantomData,
 		}
 	}
@@ -81,10 +78,10 @@ impl Connection for Client {
 				last_id: AtomicI64::new(0),
 			};
 			server::mock(route_rx);
-			Ok(Surreal {
-				router: Arc::new(OnceLock::with_value(router)),
-				engine: PhantomData,
-			})
+			Ok(Surreal::new_from_router_waiter(
+				Arc::new(OnceLock::with_value(router)),
+				Arc::new(watch::channel(None)),
+			))
 		})
 	}
 

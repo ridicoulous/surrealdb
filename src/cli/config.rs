@@ -5,6 +5,7 @@ use std::{net::SocketAddr, path::PathBuf};
 pub static CF: OnceLock<Config> = OnceLock::new();
 
 use std::time::Duration;
+use surrealdb::options::EngineOptions;
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -16,4 +17,6 @@ pub struct Config {
 	pub crt: Option<PathBuf>,
 	pub key: Option<PathBuf>,
 	pub tick_interval: Duration,
+	pub engine: Option<EngineOptions>,
+	pub no_identification_headers: bool,
 }

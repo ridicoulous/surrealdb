@@ -15,18 +15,24 @@ use crate::api::Connect;
 use crate::api::Result;
 use crate::api::Surreal;
 use crate::dbs::Notification;
+use crate::dbs::QueryMethodResponse;
 use crate::dbs::Status;
 use crate::method::Stats;
 use crate::opt::IntoEndpoint;
 use crate::sql::Value;
 use indexmap::IndexMap;
+use revision::revisioned;
+use revision::Revisioned;
+use serde::de::DeserializeOwned;
 use serde::Deserialize;
+use std::io::Read;
 use std::marker::PhantomData;
 use std::time::Duration;
 
 pub(crate) const PATH: &str = "rpc";
 const PING_INTERVAL: Duration = Duration::from_secs(5);
 const PING_METHOD: &str = "ping";
+const REVISION_HEADER: &str = "revision";
 
 /// The WS scheme used to connect to `ws://` endpoints
 #[derive(Debug)]
@@ -71,18 +77,20 @@ impl Surreal<Client> {
 			engine: PhantomData,
 			address: address.into_endpoint(),
 			capacity: 0,
-			client: PhantomData,
+			waiter: self.waiter.clone(),
 			response_type: PhantomData,
 		}
 	}
 }
 
+#[revisioned(revision = 1)]
 #[derive(Clone, Debug, Deserialize)]
 pub(crate) struct Failure {
 	pub(crate) code: i64,
 	pub(crate) message: String,
 }
 
+#[revisioned(revision = 1)]
 #[derive(Debug, Deserialize)]
 pub(crate) enum Data {
 	Other(Value),
@@ -102,13 +110,6 @@ impl From<Failure> for Error {
 			_ => Self::Query(failure.message),
 		}
 	}
-}
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct QueryMethodResponse {
-	time: String,
-	status: Status,
-	result: Value,
 }
 
 impl DbResponse {
@@ -133,6 +134,7 @@ impl DbResponse {
 								(stats, Err(Error::Query(response.result.as_raw_string()).into())),
 							);
 						}
+						_ => unreachable!(),
 					}
 				}
 
@@ -147,8 +149,31 @@ impl DbResponse {
 	}
 }
 
+#[revisioned(revision = 1)]
 #[derive(Debug, Deserialize)]
 pub(crate) struct Response {
 	id: Option<Value>,
 	pub(crate) result: ServerResult,
+}
+
+fn serialize(value: &Value, revisioned: bool) -> Result<Vec<u8>> {
+	if revisioned {
+		let mut buf = Vec::new();
+		value.serialize_revisioned(&mut buf).map_err(|error| crate::Error::Db(error.into()))?;
+		return Ok(buf);
+	}
+	crate::sql::serde::serialize(value).map_err(|error| crate::Error::Db(error.into()))
+}
+
+fn deserialize<A, T>(bytes: &mut A, revisioned: bool) -> Result<T>
+where
+	A: Read,
+	T: Revisioned + DeserializeOwned,
+{
+	if revisioned {
+		return T::deserialize_revisioned(bytes).map_err(|x| crate::Error::Db(x.into()));
+	}
+	let mut buf = Vec::new();
+	bytes.read_to_end(&mut buf).map_err(crate::err::Error::Io)?;
+	crate::sql::serde::deserialize(&buf).map_err(|error| crate::Error::Db(error.into()))
 }

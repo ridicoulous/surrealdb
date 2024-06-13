@@ -5,17 +5,18 @@ use crate::api::conn::Param;
 use crate::api::conn::Route;
 use crate::api::conn::Router;
 use crate::api::engine::local::Db;
-use crate::api::engine::local::DEFAULT_TICK_INTERVAL;
 use crate::api::opt::{Endpoint, EndpointKind};
 use crate::api::ExtraFeatures;
 use crate::api::OnceLockExt;
 use crate::api::Result;
 use crate::api::Surreal;
 use crate::dbs::Session;
-use crate::engine::IntervalStream;
+use crate::engine::tasks::start_tasks;
 use crate::iam::Level;
 use crate::kvs::Datastore;
 use crate::opt::auth::Root;
+use crate::opt::WaitFor;
+use crate::options::EngineOptions;
 use flume::Receiver;
 use flume::Sender;
 use futures::future::Either;
@@ -26,15 +27,12 @@ use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::future::Future;
-use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::atomic::AtomicI64;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::task::Poll;
-use std::time::Duration;
-use tokio::time;
-use tokio::time::MissedTickBehavior;
+use tokio::sync::watch;
 
 impl crate::api::Connection for Db {}
 
@@ -65,14 +63,14 @@ impl Connection for Db {
 			features.insert(ExtraFeatures::Backup);
 			features.insert(ExtraFeatures::LiveQueries);
 
-			Ok(Surreal {
-				router: Arc::new(OnceLock::with_value(Router {
+			Ok(Surreal::new_from_router_waiter(
+				Arc::new(OnceLock::with_value(Router {
 					features,
 					sender: route_tx,
 					last_id: AtomicI64::new(0),
 				})),
-				engine: PhantomData,
-			})
+				Arc::new(watch::channel(Some(WaitFor::Connection))),
+			))
 		})
 	}
 
@@ -120,7 +118,8 @@ pub(crate) fn router(
 				}
 				// If a root user is specified, setup the initial datastore credentials
 				if let Some(root) = configured_root {
-					if let Err(error) = kvs.setup_initial_creds(root).await {
+					if let Err(error) = kvs.setup_initial_creds(root.username, root.password).await
+					{
 						let _ = conn_tx.into_send_async(Err(error.into())).await;
 						return;
 					}
@@ -145,14 +144,32 @@ pub(crate) fn router(
 			.with_transaction_timeout(address.config.transaction_timeout)
 			.with_capabilities(address.config.capabilities);
 
+		#[cfg(any(
+			feature = "kv-mem",
+			feature = "kv-surrealkv",
+			feature = "kv-rocksdb",
+			feature = "kv-fdb",
+			feature = "kv-tikv",
+		))]
+		let kvs = match address.config.temporary_directory {
+			Some(tmp_dir) => kvs.with_temporary_directory(tmp_dir),
+			_ => kvs,
+		};
+
 		let kvs = Arc::new(kvs);
 		let mut vars = BTreeMap::new();
 		let mut live_queries = HashMap::new();
 		let mut session = Session::default().with_rt(true);
 
-		let (maintenance_tx, maintenance_rx) = flume::bounded::<()>(1);
-		let tick_interval = address.config.tick_interval.unwrap_or(DEFAULT_TICK_INTERVAL);
-		run_maintenance(kvs.clone(), tick_interval, maintenance_rx);
+		let opt = {
+			let mut engine_options = EngineOptions::default();
+			engine_options.tick_interval = address
+				.config
+				.tick_interval
+				.unwrap_or(crate::api::engine::local::DEFAULT_TICK_INTERVAL);
+			engine_options
+		};
+		let (tasks, task_chans) = start_tasks(&opt, kvs.clone());
 
 		let mut notifications = kvs.notifications();
 		let notification_stream = poll_fn(move |cx| match &mut notifications {
@@ -201,29 +218,11 @@ pub(crate) fn router(
 		}
 
 		// Stop maintenance tasks
-		let _ = maintenance_tx.into_send_async(()).await;
-	});
-}
-
-fn run_maintenance(kvs: Arc<Datastore>, tick_interval: Duration, stop_signal: Receiver<()>) {
-	tokio::spawn(async move {
-		let mut interval = time::interval(tick_interval);
-		// Don't bombard the database if we miss some ticks
-		interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
-		// Delay sending the first tick
-		interval.tick().await;
-
-		let ticker = IntervalStream::new(interval);
-
-		let streams = (ticker.map(Some), stop_signal.into_stream().map(|_| None));
-
-		let mut stream = streams.merge();
-
-		while let Some(Some(_)) = stream.next().await {
-			match kvs.tick().await {
-				Ok(()) => trace!("Node agent tick ran successfully"),
-				Err(error) => error!("Error running node agent tick: {error}"),
+		for chan in task_chans {
+			if let Err(e) = chan.send(()) {
+				error!("Error sending shutdown signal to task: {}", e);
 			}
 		}
+		tasks.resolve().await.unwrap();
 	});
 }

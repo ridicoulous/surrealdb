@@ -1,4 +1,5 @@
 use super::PATH;
+use super::{deserialize, serialize};
 use crate::api::conn::Connection;
 use crate::api::conn::DbResponse;
 use crate::api::conn::Method;
@@ -19,8 +20,7 @@ use crate::api::Result;
 use crate::api::Surreal;
 use crate::engine::remote::ws::Data;
 use crate::engine::IntervalStream;
-use crate::sql::serde::{deserialize, serialize};
-use crate::sql::Strand;
+use crate::opt::WaitFor;
 use crate::sql::Value;
 use flume::Receiver;
 use futures::stream::SplitSink;
@@ -28,28 +28,32 @@ use futures::SinkExt;
 use futures::StreamExt;
 use futures_concurrency::stream::Merge as _;
 use indexmap::IndexMap;
+use revision::revisioned;
 use serde::Deserialize;
 use std::collections::hash_map::Entry;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::future::Future;
-use std::marker::PhantomData;
+use std::mem;
 use std::pin::Pin;
 use std::sync::atomic::AtomicI64;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use tokio::net::TcpStream;
+use tokio::sync::watch;
 use tokio::time;
 use tokio::time::MissedTickBehavior;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::error::Error as WsError;
+use tokio_tungstenite::tungstenite::http::header::SEC_WEBSOCKET_PROTOCOL;
+use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::Connector;
 use tokio_tungstenite::MaybeTlsStream;
 use tokio_tungstenite::WebSocketStream;
 use trice::Instant;
-use url::Url;
 
 type WsResult<T> = std::result::Result<T, WsError>;
 
@@ -78,17 +82,29 @@ impl From<Tls> for Connector {
 }
 
 pub(crate) async fn connect(
-	url: &Url,
+	endpoint: &Endpoint,
 	config: Option<WebSocketConfig>,
 	#[allow(unused_variables)] maybe_connector: Option<Connector>,
 ) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>> {
+	let mut request = (&endpoint.url).into_client_request()?;
+
+	if endpoint.supports_revision {
+		request
+			.headers_mut()
+			.insert(SEC_WEBSOCKET_PROTOCOL, HeaderValue::from_static(super::REVISION_HEADER));
+	}
+
 	#[cfg(any(feature = "native-tls", feature = "rustls"))]
-	let (socket, _) =
-		tokio_tungstenite::connect_async_tls_with_config(url, config, NAGLE_ALG, maybe_connector)
-			.await?;
+	let (socket, _) = tokio_tungstenite::connect_async_tls_with_config(
+		request,
+		config,
+		NAGLE_ALG,
+		maybe_connector,
+	)
+	.await?;
 
 	#[cfg(not(any(feature = "native-tls", feature = "rustls")))]
-	let (socket, _) = tokio_tungstenite::connect_async_with_config(url, config, NAGLE_ALG).await?;
+	let (socket, _) = tokio_tungstenite::connect_async_with_config(request, config, NAGLE_ALG).await?;
 
 	Ok(socket)
 }
@@ -104,13 +120,13 @@ impl Connection for Client {
 	}
 
 	fn connect(
-		address: Endpoint,
+		mut address: Endpoint,
 		capacity: usize,
 	) -> Pin<Box<dyn Future<Output = Result<Surreal<Self>>> + Send + Sync + 'static>> {
 		Box::pin(async move {
-			let url = address.url.join(PATH)?;
+			address.url = address.url.join(PATH)?;
 			#[cfg(any(feature = "native-tls", feature = "rustls"))]
-			let maybe_connector = address.config.tls_config.map(Connector::from);
+			let maybe_connector = address.config.tls_config.clone().map(Connector::from);
 			#[cfg(not(any(feature = "native-tls", feature = "rustls")))]
 			let maybe_connector = None;
 
@@ -121,26 +137,26 @@ impl Connection for Client {
 				..Default::default()
 			};
 
-			let socket = connect(&url, Some(config), maybe_connector.clone()).await?;
+			let socket = connect(&address, Some(config), maybe_connector.clone()).await?;
 
 			let (route_tx, route_rx) = match capacity {
 				0 => flume::unbounded(),
 				capacity => flume::bounded(capacity),
 			};
 
-			router(url, maybe_connector, capacity, config, socket, route_rx);
+			router(address, maybe_connector, capacity, config, socket, route_rx);
 
 			let mut features = HashSet::new();
 			features.insert(ExtraFeatures::LiveQueries);
 
-			Ok(Surreal {
-				router: Arc::new(OnceLock::with_value(Router {
+			Ok(Surreal::new_from_router_waiter(
+				Arc::new(OnceLock::with_value(Router {
 					features,
 					sender: route_tx,
 					last_id: AtomicI64::new(0),
 				})),
-				engine: PhantomData,
-			})
+				Arc::new(watch::channel(Some(WaitFor::Connection))),
+			))
 		})
 	}
 
@@ -164,7 +180,7 @@ impl Connection for Client {
 
 #[allow(clippy::too_many_lines)]
 pub(crate) fn router(
-	url: Url,
+	endpoint: Endpoint,
 	maybe_connector: Option<Connector>,
 	capacity: usize,
 	config: WebSocketConfig,
@@ -176,7 +192,7 @@ pub(crate) fn router(
 			let mut request = BTreeMap::new();
 			request.insert("method".to_owned(), PING_METHOD.into());
 			let value = Value::from(request);
-			let value = serialize(&value).unwrap();
+			let value = serialize(&value, endpoint.supports_revision).unwrap();
 			Message::Binary(value)
 		};
 
@@ -198,8 +214,6 @@ pub(crate) fn router(
 				let mut interval = time::interval(PING_INTERVAL);
 				// don't bombard the server with pings if we miss some ticks
 				interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
-				// Delay sending the first ping
-				interval.tick().await;
 
 				let pinger = IntervalStream::new(interval);
 
@@ -227,13 +241,13 @@ pub(crate) fn router(
 							};
 							match method {
 								Method::Set => {
-									if let [Value::Strand(Strand(key)), value] = &params[..2] {
-										var_stash.insert(id, (key.clone(), value.clone()));
+									if let [Value::Strand(key), value] = &params[..2] {
+										var_stash.insert(id, (key.0.clone(), value.clone()));
 									}
 								}
 								Method::Unset => {
-									if let [Value::Strand(Strand(key))] = &params[..1] {
-										vars.remove(key);
+									if let [Value::Strand(key)] = &params[..1] {
+										vars.swap_remove(&key.0);
 									}
 								}
 								Method::Live => {
@@ -272,7 +286,8 @@ pub(crate) fn router(
 								}
 								let payload = Value::from(request);
 								trace!("Request {payload}");
-								let payload = serialize(&payload).unwrap();
+								let payload =
+									serialize(&payload, endpoint.supports_revision).unwrap();
 								Message::Binary(payload)
 							};
 							if let Method::Authenticate
@@ -316,7 +331,7 @@ pub(crate) fn router(
 							last_activity = Instant::now();
 							match result {
 								Ok(message) => {
-									match Response::try_from(&message) {
+									match Response::try_from(&message, endpoint.supports_revision) {
 										Ok(option) => {
 											// We are only interested in responses that are not empty
 											if let Some(response) = option {
@@ -331,17 +346,35 @@ pub(crate) fn router(
 															{
 																if matches!(method, Method::Set) {
 																	if let Some((key, value)) =
-																		var_stash.remove(&id)
+																		var_stash.swap_remove(&id)
 																	{
 																		vars.insert(key, value);
 																	}
 																}
 																// Send the response back to the caller
+																let mut response = response.result;
+																if matches!(method, Method::Insert)
+																{
+																	// For insert, we need to flatten single responses in an array
+																	if let Ok(Data::Other(
+																		Value::Array(value),
+																	)) = &mut response
+																	{
+																		if let [value] =
+																			&mut value.0[..]
+																		{
+																			response =
+																				Ok(Data::Other(
+																					mem::take(
+																						value,
+																					),
+																				));
+																		}
+																	}
+																}
 																let _res = sender
 																	.into_send_async(
-																		DbResponse::from(
-																			response.result,
-																		),
+																		DbResponse::from(response),
 																	)
 																	.await;
 															}
@@ -381,9 +414,12 @@ pub(crate) fn router(
 																		);
 																		let value =
 																			Value::from(request);
-																		let value =
-																			serialize(&value)
-																				.unwrap();
+																		let value = serialize(
+																			&value,
+																			endpoint
+																				.supports_revision,
+																		)
+																		.unwrap();
 																		Message::Binary(value)
 																	};
 																	if let Err(error) =
@@ -403,6 +439,7 @@ pub(crate) fn router(
 											}
 										}
 										Err(error) => {
+											#[revisioned(revision = 1)]
 											#[derive(Deserialize)]
 											struct Response {
 												id: Option<Value>,
@@ -412,8 +449,10 @@ pub(crate) fn router(
 											if let Message::Binary(binary) = message {
 												if let Ok(Response {
 													id,
-												}) = deserialize(&binary)
-												{
+												}) = deserialize(
+													&mut &binary[..],
+													endpoint.supports_revision,
+												) {
 													// Return an error if an ID was returned
 													if let Some(Ok(id)) =
 														id.map(Value::coerce_to_i64)
@@ -475,7 +514,7 @@ pub(crate) fn router(
 
 			'reconnect: loop {
 				trace!("Reconnecting...");
-				match connect(&url, Some(config), maybe_connector.clone()).await {
+				match connect(&endpoint, Some(config), maybe_connector.clone()).await {
 					Ok(s) => {
 						socket = s;
 						for (_, message) in &replay {
@@ -514,19 +553,21 @@ pub(crate) fn router(
 }
 
 impl Response {
-	fn try_from(message: &Message) -> Result<Option<Self>> {
+	fn try_from(message: &Message, supports_revision: bool) -> Result<Option<Self>> {
 		match message {
 			Message::Text(text) => {
 				trace!("Received an unexpected text message; {text}");
 				Ok(None)
 			}
-			Message::Binary(binary) => deserialize(binary).map(Some).map_err(|error| {
-				Error::ResponseFromBinary {
-					binary: binary.clone(),
-					error,
-				}
-				.into()
-			}),
+			Message::Binary(binary) => {
+				deserialize(&mut &binary[..], supports_revision).map(Some).map_err(|error| {
+					Error::ResponseFromBinary {
+						binary: binary.clone(),
+						error: bincode::ErrorKind::Custom(error.to_string()).into(),
+					}
+					.into()
+				})
+			}
 			Message::Ping(..) => {
 				trace!("Received a ping from the server");
 				Ok(None)
@@ -548,3 +589,182 @@ impl Response {
 }
 
 pub struct Socket(Option<SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>>);
+
+#[cfg(test)]
+mod tests {
+	use super::serialize;
+	use bincode::Options;
+	use flate2::write::GzEncoder;
+	use flate2::Compression;
+	use rand::{thread_rng, Rng};
+	use std::io::Write;
+	use std::time::SystemTime;
+	use surrealdb_core::rpc::format::cbor::Cbor;
+	use surrealdb_core::sql::{Array, Value};
+
+	#[test_log::test]
+	fn large_vector_serialisation_bench() {
+		//
+		let timed = |func: &dyn Fn() -> Vec<u8>| {
+			let start = SystemTime::now();
+			let r = func();
+			(start.elapsed().unwrap(), r)
+		};
+		//
+		let compress = |v: &Vec<u8>| {
+			let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+			encoder.write_all(&v).unwrap();
+			encoder.finish().unwrap()
+		};
+		// Generate a random vector
+		let vector_size = if cfg!(debug_assertions) {
+			200_000 // Debug is slow
+		} else {
+			2_000_000 // Release is fast
+		};
+		let mut vector: Vec<i32> = Vec::new();
+		let mut rng = thread_rng();
+		for _ in 0..vector_size {
+			vector.push(rng.gen());
+		}
+		//	Store the results
+		let mut results = vec![];
+		// Calculate the reference
+		let ref_payload;
+		let ref_compressed;
+		//
+		const BINCODE_REF: &str = "Bincode Vec<i32>";
+		const COMPRESSED_BINCODE_REF: &str = "Compressed Bincode Vec<i32>";
+		{
+			// Bincode Vec<i32>
+			let (duration, payload) = timed(&|| {
+				let mut payload = Vec::new();
+				bincode::options()
+					.with_fixint_encoding()
+					.serialize_into(&mut payload, &vector)
+					.unwrap();
+				payload
+			});
+			ref_payload = payload.len() as f32;
+			results.push((payload.len(), BINCODE_REF, duration, 1.0));
+
+			// Compressed bincode
+			let (compression_duration, payload) = timed(&|| compress(&payload));
+			let duration = duration + compression_duration;
+			ref_compressed = payload.len() as f32;
+			results.push((payload.len(), COMPRESSED_BINCODE_REF, duration, 1.0));
+		}
+		// Build the Value
+		let vector = Value::Array(Array::from(vector));
+		//
+		const BINCODE: &str = "Bincode Vec<Value>";
+		const COMPRESSED_BINCODE: &str = "Compressed Bincode Vec<Value>";
+		{
+			// Bincode Vec<i32>
+			let (duration, payload) = timed(&|| {
+				let mut payload = Vec::new();
+				bincode::options()
+					.with_varint_encoding()
+					.serialize_into(&mut payload, &vector)
+					.unwrap();
+				payload
+			});
+			results.push((payload.len(), BINCODE, duration, payload.len() as f32 / ref_payload));
+
+			// Compressed bincode
+			let (compression_duration, payload) = timed(&|| compress(&payload));
+			let duration = duration + compression_duration;
+			results.push((
+				payload.len(),
+				COMPRESSED_BINCODE,
+				duration,
+				payload.len() as f32 / ref_compressed,
+			));
+		}
+		const UNVERSIONED: &str = "Unversioned Vec<Value>";
+		const COMPRESSED_UNVERSIONED: &str = "Compressed Unversioned Vec<Value>";
+		{
+			// Unversioned
+			let (duration, payload) = timed(&|| serialize(&vector, false).unwrap());
+			results.push((
+				payload.len(),
+				UNVERSIONED,
+				duration,
+				payload.len() as f32 / ref_payload,
+			));
+
+			// Compressed Versioned
+			let (compression_duration, payload) = timed(&|| compress(&payload));
+			let duration = duration + compression_duration;
+			results.push((
+				payload.len(),
+				COMPRESSED_UNVERSIONED,
+				duration,
+				payload.len() as f32 / ref_compressed,
+			));
+		}
+		//
+		const VERSIONED: &str = "Versioned Vec<Value>";
+		const COMPRESSED_VERSIONED: &str = "Compressed Versioned Vec<Value>";
+		{
+			// Versioned
+			let (duration, payload) = timed(&|| serialize(&vector, true).unwrap());
+			results.push((payload.len(), VERSIONED, duration, payload.len() as f32 / ref_payload));
+
+			// Compressed Versioned
+			let (compression_duration, payload) = timed(&|| compress(&payload));
+			let duration = duration + compression_duration;
+			results.push((
+				payload.len(),
+				COMPRESSED_VERSIONED,
+				duration,
+				payload.len() as f32 / ref_compressed,
+			));
+		}
+		//
+		const CBOR: &str = "CBor Vec<Value>";
+		const COMPRESSED_CBOR: &str = "Compressed CBor Vec<Value>";
+		{
+			// CBor
+			let (duration, payload) = timed(&|| {
+				let cbor: Cbor = vector.clone().try_into().unwrap();
+				let mut res = Vec::new();
+				ciborium::into_writer(&cbor.0, &mut res).unwrap();
+				res
+			});
+			results.push((payload.len(), CBOR, duration, payload.len() as f32 / ref_payload));
+
+			// Compressed Cbor
+			let (compression_duration, payload) = timed(&|| compress(&payload));
+			let duration = duration + compression_duration;
+			results.push((
+				payload.len(),
+				COMPRESSED_CBOR,
+				duration,
+				payload.len() as f32 / ref_compressed,
+			));
+		}
+		// Sort the results by ascending size
+		results.sort_by(|(a, _, _, _), (b, _, _, _)| a.cmp(b));
+		for (size, name, duration, factor) in &results {
+			info!("{name} - Size: {size} - Duration: {duration:?} - Factor: {factor}");
+		}
+		// Check the expected sorted results
+		let results: Vec<&str> = results.into_iter().map(|(_, name, _, _)| name).collect();
+		assert_eq!(
+			results,
+			vec![
+				BINCODE_REF,
+				COMPRESSED_BINCODE_REF,
+				COMPRESSED_CBOR,
+				COMPRESSED_BINCODE,
+				COMPRESSED_UNVERSIONED,
+				CBOR,
+				COMPRESSED_VERSIONED,
+				BINCODE,
+				UNVERSIONED,
+				VERSIONED,
+			]
+		)
+	}
+}

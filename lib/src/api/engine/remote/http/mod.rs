@@ -13,14 +13,15 @@ use crate::api::conn::MlConfig;
 use crate::api::conn::Param;
 use crate::api::engine::create_statement;
 use crate::api::engine::delete_statement;
+use crate::api::engine::insert_statement;
 use crate::api::engine::merge_statement;
 use crate::api::engine::patch_statement;
 use crate::api::engine::remote::duration_from_str;
 use crate::api::engine::select_statement;
 use crate::api::engine::update_statement;
+use crate::api::engine::upsert_statement;
 use crate::api::err::Error;
 use crate::api::method::query::QueryResult;
-use crate::api::opt::from_value;
 use crate::api::Connect;
 use crate::api::Response as QueryResponse;
 use crate::api::Result;
@@ -28,13 +29,12 @@ use crate::api::Surreal;
 use crate::dbs::Status;
 use crate::headers::AUTH_DB;
 use crate::headers::AUTH_NS;
-use crate::headers::DB_LEGACY;
-use crate::headers::NS_LEGACY;
+use crate::headers::DB;
+use crate::headers::NS;
 use crate::method::Stats;
 use crate::opt::IntoEndpoint;
+use crate::sql::from_value;
 use crate::sql::serde::deserialize;
-use crate::sql::Array;
-use crate::sql::Strand;
 use crate::sql::Value;
 #[cfg(not(target_arch = "wasm32"))]
 use futures::TryStreamExt;
@@ -103,7 +103,7 @@ impl Surreal<Client> {
 			engine: PhantomData,
 			address: address.into_endpoint(),
 			capacity: 0,
-			client: PhantomData,
+			waiter: self.waiter.clone(),
 			response_type: PhantomData,
 		}
 	}
@@ -208,6 +208,7 @@ async fn query(request: RequestBuilder) -> Result<QueryResponse> {
 			Status::Err => {
 				map.insert(index, (stats, Err(Error::Query(value.as_raw_string()).into())));
 			}
+			_ => unreachable!(),
 		}
 	}
 
@@ -218,12 +219,12 @@ async fn query(request: RequestBuilder) -> Result<QueryResponse> {
 }
 
 async fn take(one: bool, request: RequestBuilder) -> Result<Value> {
-	if let Some((_stats, result)) = query(request).await?.results.remove(&0) {
+	if let Some((_stats, result)) = query(request).await?.results.swap_remove(&0) {
 		let value = result?;
 		match one {
 			true => match value {
-				Value::Array(Array(mut vec)) => {
-					if let [value] = &mut vec[..] {
+				Value::Array(mut vec) => {
+					if let [value] = &mut vec.0[..] {
 						return Ok(mem::take(value));
 					}
 				}
@@ -235,7 +236,7 @@ async fn take(one: bool, request: RequestBuilder) -> Result<Value> {
 	}
 	match one {
 		true => Ok(Value::None),
-		false => Ok(Value::Array(Array(vec![]))),
+		false => Ok(Value::Array(Default::default())),
 	}
 }
 
@@ -358,17 +359,17 @@ async fn router(
 			let path = base_url.join(SQL_PATH)?;
 			let mut request = client.post(path).headers(headers.clone());
 			let (ns, db) = match &mut params[..] {
-				[Value::Strand(Strand(ns)), Value::Strand(Strand(db))] => {
-					(Some(mem::take(ns)), Some(mem::take(db)))
+				[Value::Strand(ns), Value::Strand(db)] => {
+					(Some(mem::take(&mut ns.0)), Some(mem::take(&mut db.0)))
 				}
-				[Value::Strand(Strand(ns)), Value::None] => (Some(mem::take(ns)), None),
-				[Value::None, Value::Strand(Strand(db))] => (None, Some(mem::take(db))),
+				[Value::Strand(ns), Value::None] => (Some(mem::take(&mut ns.0)), None),
+				[Value::None, Value::Strand(db)] => (None, Some(mem::take(&mut db.0))),
 				_ => unreachable!(),
 			};
 			let ns = match ns {
 				Some(ns) => match HeaderValue::try_from(&ns) {
 					Ok(ns) => {
-						request = request.header(&NS_LEGACY, &ns);
+						request = request.header(&NS, &ns);
 						Some(ns)
 					}
 					Err(_) => {
@@ -380,7 +381,7 @@ async fn router(
 			let db = match db {
 				Some(db) => match HeaderValue::try_from(&db) {
 					Ok(db) => {
-						request = request.header(&DB_LEGACY, &db);
+						request = request.header(&DB, &db);
 						Some(db)
 					}
 					Err(_) => {
@@ -392,10 +393,10 @@ async fn router(
 			request = request.auth(auth).body("RETURN true");
 			take(true, request).await?;
 			if let Some(ns) = ns {
-				headers.insert(&NS_LEGACY, ns);
+				headers.insert(&NS, ns);
 			}
 			if let Some(db) = db {
-				headers.insert(&DB_LEGACY, db);
+				headers.insert(&DB, db);
 			}
 			Ok(DbResponse::Other(Value::None))
 		}
@@ -442,7 +443,7 @@ async fn router(
 		Method::Authenticate => {
 			let path = base_url.join(SQL_PATH)?;
 			let token = match &mut params[..1] {
-				[Value::Strand(Strand(token))] => mem::take(token),
+				[Value::Strand(token)] => mem::take(&mut token.0),
 				_ => unreachable!(),
 			};
 			let request =
@@ -465,9 +466,25 @@ async fn router(
 			let value = take(true, request).await?;
 			Ok(DbResponse::Other(value))
 		}
+		Method::Upsert => {
+			let path = base_url.join(SQL_PATH)?;
+			let (one, statement) = upsert_statement(&mut params);
+			let request =
+				client.post(path).headers(headers.clone()).auth(auth).body(statement.to_string());
+			let value = take(one, request).await?;
+			Ok(DbResponse::Other(value))
+		}
 		Method::Update => {
 			let path = base_url.join(SQL_PATH)?;
 			let (one, statement) = update_statement(&mut params);
+			let request =
+				client.post(path).headers(headers.clone()).auth(auth).body(statement.to_string());
+			let value = take(one, request).await?;
+			Ok(DbResponse::Other(value))
+		}
+		Method::Insert => {
+			let path = base_url.join(SQL_PATH)?;
+			let (one, statement) = insert_statement(&mut params);
 			let request =
 				client.post(path).headers(headers.clone()).auth(auth).body(statement.to_string());
 			let value = take(one, request).await?;
@@ -570,7 +587,7 @@ async fn router(
 		Method::Set => {
 			let path = base_url.join(SQL_PATH)?;
 			let (key, value) = match &mut params[..2] {
-				[Value::Strand(Strand(key)), value] => (mem::take(key), value.to_string()),
+				[Value::Strand(key), value] => (mem::take(&mut key.0), value.to_string()),
 				_ => unreachable!(),
 			};
 			let request = client
@@ -584,8 +601,8 @@ async fn router(
 			Ok(DbResponse::Other(Value::None))
 		}
 		Method::Unset => {
-			if let [Value::Strand(Strand(key))] = &params[..1] {
-				vars.remove(key);
+			if let [Value::Strand(key)] = &params[..1] {
+				vars.swap_remove(&key.0);
 			}
 			Ok(DbResponse::Other(Value::None))
 		}

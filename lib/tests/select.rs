@@ -220,6 +220,12 @@ async fn select_expression_value() -> Result<(), Error> {
 				},
 				{
 					detail: {
+						type: 'Memory'
+					},
+					operation: 'Collector'
+				},
+				{
+					detail: {
 						count: 2,
 					},
 					operation: 'Fetch'
@@ -235,7 +241,7 @@ async fn select_expression_value() -> Result<(), Error> {
 async fn select_dynamic_array_keys_and_object_keys() -> Result<(), Error> {
 	let sql = "
 		LET $lang = 'en';
-		UPDATE documentation:test CONTENT {
+		UPSERT documentation:test CONTENT {
 			primarylang: 'en',
 			languages: {
 				'en': 'this is english',
@@ -253,11 +259,11 @@ async fn select_dynamic_array_keys_and_object_keys() -> Result<(), Error> {
 		-- Selecting an object value or array index using a string as a key
 		SELECT languages['en'] AS content FROM documentation:test;
 		-- Updating an object value or array index using a string as a key
-		UPDATE documentation:test SET languages['en'] = 'my primary text';
+		UPSERT documentation:test SET languages['en'] = 'my primary text';
 		-- Selecting an object value or array index using a parameter as a key
 		SELECT languages[$lang] AS content FROM documentation:test;
 		-- Updating an object value or array index using a parameter as a key
-		UPDATE documentation:test SET languages[$lang] = 'my secondary text';
+		UPSERT documentation:test SET languages[$lang] = 'my secondary text';
 		-- Selecting an object or array index value using the value of another document field as a key
 		SELECT languages[primarylang] AS content FROM documentation;
 	";
@@ -353,11 +359,11 @@ async fn select_dynamic_array_keys_and_object_keys() -> Result<(), Error> {
 #[tokio::test]
 async fn select_writeable_subqueries() -> Result<(), Error> {
 	let sql = "
-		LET $id = (UPDATE tester:test);
+		LET $id = (UPSERT tester:test);
 		RETURN $id;
-		LET $id = (UPDATE tester:test).id;
+		LET $id = (UPSERT tester:test).id;
 		RETURN $id;
-		LET $id = (SELECT VALUE id FROM (UPDATE tester:test))[0];
+		LET $id = (SELECT VALUE id FROM (UPSERT tester:test))[0];
 		RETURN $id;
 	";
 	let dbs = new_ds().await?;
@@ -521,6 +527,12 @@ async fn select_where_field_is_thing_and_with_index() -> Result<(), Error> {
 						table: 'post',
 					},
 					operation: 'Iterate Index'
+				},
+				{
+					detail: {
+						type: 'Memory'
+					},
+					operation: 'Collector'
 				}
 		]",
 	);
@@ -539,6 +551,12 @@ async fn select_where_field_is_thing_and_with_index() -> Result<(), Error> {
 						table: 'post',
 					},
 					operation: 'Iterate Index'
+				},
+				{
+					detail: {
+						type: 'Memory'
+					},
+					operation: 'Collector'
 				},
 				{
 					detail: {
@@ -597,6 +615,12 @@ async fn select_where_and_with_index() -> Result<(), Error> {
 						table: 'person',
 					},
 					operation: 'Iterate Index'
+				},
+				{
+					detail: {
+						type: 'Memory'
+					},
+					operation: 'Collector'
 				}
 		]",
 	);
@@ -644,6 +668,12 @@ async fn select_where_and_with_unique_index() -> Result<(), Error> {
 						table: 'person',
 					},
 					operation: 'Iterate Index'
+				},
+				{
+					detail: {
+						type: 'Memory'
+					},
+					operation: 'Collector'
 				}
 		]",
 	);
@@ -693,6 +723,12 @@ async fn select_where_and_with_fulltext_index() -> Result<(), Error> {
 						table: 'person',
 					},
 					operation: 'Iterate Index'
+				},
+				{
+					detail: {
+						type: 'Memory'
+					},
+					operation: 'Collector'
 				}
 		]",
 	);
@@ -741,7 +777,13 @@ async fn select_where_explain() -> Result<(), Error> {
 						table: 'software',
 					},
 					operation: 'Iterate Table'
-				}
+				},
+                {
+					detail: {
+						type: 'Memory'
+					},
+					operation: 'Collector'
+				},
 			]",
 	);
 	assert_eq!(tmp, val);
@@ -760,6 +802,12 @@ async fn select_where_explain() -> Result<(), Error> {
 						table: 'software',
 					},
 					operation: 'Iterate Table'
+				},
+                {
+					detail: {
+						type: 'Memory'
+					},
+					operation: 'Collector'
 				},
 				{
 					detail: {
@@ -1100,13 +1148,16 @@ async fn select_only() -> Result<(), Error> {
 }
 
 #[tokio::test]
-async fn select_on_future() -> Result<(), Error> {
-	let insert_query = "
-		CREATE person SET name = \"Hana\", age = 10, can_drive = <future>{ age > 17 };
-		CREATE person SET name = \"Hendrick\", age = 18, can_drive = <future>{ age > 17 };
+async fn select_issue_3510() -> Result<(), Error> {
+	let sql: &str = "
+		CREATE a:1;
+		CREATE b:1 SET link = a:1, num = 1;
+		SELECT link.* FROM b;
+		SELECT link.* FROM b WHERE num = 1;
 	";
 	let dbs = new_ds().await?;
 	let ses = Session::owner().with_ns("test").with_db("test");
+<<<<<<< HEAD
 	dbs.execute_sql(insert_query, &ses, None).await?;
 
 	let select_query_true = "
@@ -1121,9 +1172,27 @@ async fn select_on_future() -> Result<(), Error> {
 		SELECT name FROM person WHERE !can_drive
 	";
 	let mut res = dbs.execute_sql(select_query_false, &ses, None).await?;
+=======
+	let res = &mut dbs.execute(sql, &ses, None).await?;
+	assert_eq!(res.len(), 4);
+	//
+	let _ = res.remove(0).result?;
+	let _ = res.remove(0).result?;
+	//
 	let tmp = res.remove(0).result?;
-	let val = Value::parse("[{ name: \"Hana\" }]");
-	assert_eq!(tmp, val);
-
+	let val = Value::parse(
+		"[
+				{
+					link: {
+						id: a:1
+					}
+				}
+			]",
+	);
+	assert_eq!(format!("{:#}", tmp), format!("{:#}", val));
+	//
+>>>>>>> main
+	let tmp = res.remove(0).result?;
+	assert_eq!(format!("{:#}", tmp), format!("{:#}", val));
 	Ok(())
 }

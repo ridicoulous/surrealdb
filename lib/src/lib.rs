@@ -14,13 +14,22 @@
 //! # Examples
 //!
 //! ```no_run
+//! use std::borrow::Cow;
 //! use serde::{Serialize, Deserialize};
 //! use serde_json::json;
-//! use std::borrow::Cow;
-//! use surrealdb::{Result, Surreal};
-//! use surrealdb::sql;
+//! use surrealdb::{Error, Surreal};
 //! use surrealdb::opt::auth::Root;
 //! use surrealdb::engine::remote::ws::Ws;
+//!
+//! #[derive(Serialize, Deserialize)]
+//! struct Person {
+//!     title: String,
+//!     name: Name,
+//!     marketing: bool,
+//! }
+//!
+//! // Pro tip: Replace String with Cow<'static, str> to
+//! // avoid unnecessary heap allocations when inserting
 //!
 //! #[derive(Serialize, Deserialize)]
 //! struct Name {
@@ -28,15 +37,16 @@
 //!     last: Cow<'static, str>,
 //! }
 //!
-//! #[derive(Serialize, Deserialize)]
-//! struct Person {
-//!     title: Cow<'static, str>,
-//!     name: Name,
-//!     marketing: bool,
-//! }
-//!
+//! // Install at https://surrealdb.com/install
+//! // and use `surreal start --user root --pass root`
+//! // to start a working database to take the following queries
+
+//! // See the results via `surreal sql --ns namespace --db database --pretty`
+//! // or https://surrealist.app/
+//! // followed by the query `SELECT * FROM person;`
+
 //! #[tokio::main]
-//! async fn main() -> Result<()> {
+//! async fn main() -> Result<(), Error> {
 //!     let db = Surreal::new::<Ws>("localhost:8000").await?;
 //!
 //!     // Signin as a namespace, database, or root user
@@ -81,13 +91,13 @@
 //!     let people: Vec<Person> = db.select("person").await?;
 //!
 //!     // Perform a custom advanced query
-//!     let sql = r#"
+//!     let query = r#"
 //!         SELECT marketing, count()
 //!         FROM type::table($table)
 //!         GROUP BY marketing
 //!     "#;
 //!
-//!     let groups = db.query(sql)
+//!     let groups = db.query(query)
 //!         .bind(("table", "person"))
 //!         .await?;
 //!
@@ -98,14 +108,16 @@
 #![doc(html_favicon_url = "https://surrealdb.s3.amazonaws.com/favicon.png")]
 #![doc(html_logo_url = "https://surrealdb.s3.amazonaws.com/icon.png")]
 #![cfg_attr(docsrs, feature(doc_cfg))]
+#![cfg_attr(test, deny(warnings))]
+
+#[cfg(all(target_arch = "wasm32", feature = "ml"))]
+compile_error!("The `ml` feature is not supported on the `wasm32` architecture.");
 
 #[macro_use]
 extern crate tracing;
 
-#[macro_use]
-mod mac;
-
 mod api;
+<<<<<<< HEAD
 mod cf;
 mod ctx;
 mod doc;
@@ -140,6 +152,8 @@ pub mod kvs;
 pub mod obs;
 #[doc(hidden)]
 pub mod syn;
+=======
+>>>>>>> main
 
 #[doc(inline)]
 pub use api::engine;
@@ -160,6 +174,9 @@ pub use api::Response;
 pub use api::Result;
 #[doc(inline)]
 pub use api::Surreal;
+#[doc(inline)]
+pub use surrealdb_core::*;
+
 use uuid::Uuid;
 
 #[doc(hidden)]
@@ -194,6 +211,7 @@ impl From<dbs::Action> for Action {
 			dbs::Action::Create => Self::Create,
 			dbs::Action::Update => Self::Update,
 			dbs::Action::Delete => Self::Delete,
+			_ => unreachable!(),
 		}
 	}
 }

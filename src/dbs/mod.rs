@@ -1,13 +1,13 @@
 use crate::cli::CF;
 use crate::err::Error;
 use clap::Args;
-use std::sync::OnceLock;
+use std::path::PathBuf;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use surrealdb::dbs::capabilities::{Capabilities, FuncTarget, NetTarget, Targets};
 use surrealdb::kvs::Datastore;
-use surrealdb::opt::auth::Root;
 
-pub static DB: OnceLock<Datastore> = OnceLock::new();
+pub static DB: OnceLock<Arc<Datastore>> = OnceLock::new();
 
 #[derive(Args, Debug)]
 pub struct StartCommandDbsOptions {
@@ -23,21 +23,17 @@ pub struct StartCommandDbsOptions {
 	#[arg(env = "SURREAL_TRANSACTION_TIMEOUT", long)]
 	#[arg(value_parser = super::cli::validator::duration)]
 	transaction_timeout: Option<Duration>,
-	#[arg(help = "Whether to enable authentication", help_heading = "Authentication")]
-	#[arg(env = "SURREAL_AUTH", long = "auth")]
+	#[arg(help = "Whether to allow unauthenticated access", help_heading = "Authentication")]
+	#[arg(env = "SURREAL_UNAUTHENTICATED", long = "unauthenticated")]
 	#[arg(default_value_t = false)]
-	auth_enabled: bool,
-	// TODO(gguillemas): Remove this argument once the legacy authentication is deprecated in v2.0.0
-	#[arg(
-		help = "Whether to enable explicit authentication level selection",
-		help_heading = "Authentication"
-	)]
-	#[arg(env = "SURREAL_AUTH_LEVEL_ENABLED", long = "auth-level-enabled")]
-	#[arg(default_value_t = false)]
-	auth_level_enabled: bool,
+	unauthenticated: bool,
 	#[command(flatten)]
 	#[command(next_help_heading = "Capabilities")]
 	caps: DbsCapabilities,
+	#[arg(help = "Sets the directory for storing temporary database files")]
+	#[arg(env = "SURREAL_TEMPORARY_DIRECTORY", long = "temporary-directory")]
+	#[arg(value_parser = super::cli::validator::dir_exists)]
+	temporary_directory: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -211,10 +207,9 @@ pub async fn init(
 		strict_mode,
 		query_timeout,
 		transaction_timeout,
-		auth_enabled,
-		// TODO(gguillemas): Remove this field once the legacy authentication is deprecated in v2.0.0
-		auth_level_enabled,
+		unauthenticated,
 		caps,
+		temporary_directory,
 	}: StartCommandDbsOptions,
 ) -> Result<(), Error> {
 	// Get local copy of options
@@ -229,44 +224,44 @@ pub async fn init(
 	if let Some(v) = transaction_timeout {
 		debug!("Maximum transaction processing timeout is {v:?}");
 	}
-	// Log whether authentication is enabled
-	if auth_enabled {
-		info!("✅🔒 Authentication is enabled 🔒✅");
-	} else {
+	// Log whether authentication is disabled
+	if unauthenticated {
 		warn!("❌🔒 IMPORTANT: Authentication is disabled. This is not recommended for production use. 🔒❌");
-	}
-	// Log whether authentication levels are enabled
-	// TODO(gguillemas): Remove this condition once the legacy authentication is deprecated in v2.0.0
-	if auth_level_enabled {
-		info!("Authentication levels are enabled");
 	}
 
 	let caps = caps.into();
 	debug!("Server capabilities: {caps}");
 
+	#[allow(unused_mut)]
 	// Parse and setup the desired kv datastore
-	let dbs = Datastore::new(&opt.path)
+	let mut dbs = Datastore::new(&opt.path)
 		.await?
 		.with_notifications()
 		.with_strict_mode(strict_mode)
 		.with_query_timeout(query_timeout)
 		.with_transaction_timeout(transaction_timeout)
-		.with_auth_enabled(auth_enabled)
-		.with_auth_level_enabled(auth_level_enabled)
+		.with_auth_enabled(!unauthenticated)
 		.with_capabilities(caps);
+
+	let mut dbs = match temporary_directory {
+		Some(tmp_dir) => dbs.with_temporary_directory(tmp_dir),
+		_ => dbs,
+	};
+
+	if let Some(engine_options) = opt.engine {
+		dbs = dbs.with_engine_options(engine_options);
+	}
+	// Make immutable
+	let dbs = dbs;
 
 	dbs.bootstrap().await?;
 
 	if let Some(user) = opt.user.as_ref() {
-		dbs.setup_initial_creds(Root {
-			username: user,
-			password: opt.pass.as_ref().unwrap(),
-		})
-		.await?;
+		dbs.setup_initial_creds(user, opt.pass.as_ref().unwrap()).await?;
 	}
 
 	// Store database instance
-	let _ = DB.set(dbs);
+	let _ = DB.set(Arc::new(dbs));
 
 	// All ok
 	Ok(())
@@ -278,11 +273,12 @@ mod tests {
 
 	use surrealdb::dbs::Session;
 	use surrealdb::iam::verify::verify_root_creds;
-	use surrealdb::kvs::{Datastore, LockType::*, TransactionType::*};
+	use surrealdb::kvs::{LockType::*, TransactionType::*};
 	use test_log::test;
 	use wiremock::{matchers::method, Mock, MockServer, ResponseTemplate};
 
 	use super::*;
+	use surrealdb::opt::auth::Root;
 
 	#[test(tokio::test)]
 	async fn test_setup_superuser() {
@@ -297,7 +293,7 @@ mod tests {
 			ds.transaction(Read, Optimistic).await.unwrap().all_root_users().await.unwrap().len(),
 			0
 		);
-		ds.setup_initial_creds(creds).await.unwrap();
+		ds.setup_initial_creds(creds.username, creds.password).await.unwrap();
 		assert_eq!(
 			ds.transaction(Read, Optimistic).await.unwrap().all_root_users().await.unwrap().len(),
 			1
@@ -318,7 +314,7 @@ mod tests {
 			.unwrap()
 			.hash;
 
-		ds.setup_initial_creds(creds).await.unwrap();
+		ds.setup_initial_creds(creds.username, creds.password).await.unwrap();
 		assert_eq!(
 			pass_hash,
 			ds.transaction(Read, Optimistic)
